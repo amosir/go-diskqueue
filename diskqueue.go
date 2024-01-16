@@ -58,51 +58,71 @@ type Interface interface {
 type diskQueue struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 
-	// run-time state (also persisted to disk)
-	readPos      int64
-	writePos     int64
-	readFileNum  int64
+	// 当前读取位置
+	readPos int64
+	// 当前写入位置
+	writePos int64
+	// 读取位置所在的文件编号
+	readFileNum int64
+	// 写入位置所在的文件编号
 	writeFileNum int64
-	depth        int64
+	// 队列中的消息数
+	depth int64
 
 	sync.RWMutex
 
 	// instantiation time metadata
-	name                string
-	dataPath            string
-	maxBytesPerFile     int64 // cannot change once created
+	name string
+	// 数据保存的目录
+	dataPath string
+	// 单文件可保存的最大字节数，超过这个值要创建新文件
+	maxBytesPerFile int64 // cannot change once created
+	// 可从当前读取文件中读的最大数据大小
 	maxBytesPerFileRead int64
-	minMsgSize          int32
-	maxMsgSize          int32
-	syncEvery           int64         // number of writes per fsync
-	syncTimeout         time.Duration // duration of time per fsync
-	exitFlag            int32
-	needSync            bool
+	// 消息大小的最小值
+	minMsgSize int32
+	// 消息大小的最大值
+	maxMsgSize int32
+	// 指定写入多少条消息后需要进行一次 fsync 操作
+	syncEvery int64 // number of writes per fsync
+	// 定时刷盘的周期
+	syncTimeout time.Duration // duration of time per fsync
+	exitFlag    int32
+	// 是否需要刷盘
+	needSync bool
 
 	// keeps track of the position where we have read
 	// (but not yet sent over readChan)
-	nextReadPos     int64
+	// 下一次读取位置
+	nextReadPos int64
+	// 下一次写入位置
 	nextReadFileNum int64
 
 	readFile  *os.File
 	writeFile *os.File
-	reader    *bufio.Reader
-	writeBuf  bytes.Buffer
+	// 待读取文件对应的 reader 对象(带缓冲的)
+	reader *bufio.Reader
+	// 写缓存，向文件中写入数据前，会先将数据写入到缓存中
+	writeBuf bytes.Buffer
 
-	// exposed via ReadChan()
+	// ReadChan() 返回此 channel，用于读取队列中的数据
 	readChan chan []byte
 
 	// exposed via PeekChan()
 	peekChan chan []byte
 
 	// internal channels
-	depthChan         chan int64
-	writeChan         chan []byte
+	depthChan chan int64
+	// 调用 Put 方法写入数据时，会先将数据保存在 writeChan，再由 ioloop 协程异步处理
+	writeChan chan []byte
+	// Put 方法阻塞在此 channel，直到 ioLoop 处理完
 	writeResponseChan chan error
+	// 调用 Empty 方法清空数据时，通过 emptyChan 向 ioloop 协程发送指令
 	emptyChan         chan int
 	emptyResponseChan chan error
-	exitChan          chan int
-	exitSyncChan      chan int
+	// 关闭 channel 时，通过此 channel 向 ioLoop 发送退出指令
+	exitChan     chan int
+	exitSyncChan chan int
 
 	logf AppLogFunc
 }
@@ -132,7 +152,7 @@ func New(name string, dataPath string, maxBytesPerFile int64,
 		logf:              logf,
 	}
 
-	// no need to lock here, nothing else could possibly be touching this instance
+	// 从元数据文件中恢复上一次读写的位置信息，包括: 读写文件编号、读写位置和队列中数据量
 	err := d.retrieveMetaData()
 	if err != nil && !os.IsNotExist(err) {
 		d.logf(ERROR, "DISKQUEUE(%s) failed to retrieveMetaData - %s", d.name, err)
@@ -161,7 +181,6 @@ func (d *diskQueue) PeekChan() <-chan []byte {
 	return d.peekChan
 }
 
-// Put writes a []byte to the queue
 func (d *diskQueue) Put(data []byte) error {
 	d.RLock()
 	defer d.RUnlock()
@@ -170,6 +189,7 @@ func (d *diskQueue) Put(data []byte) error {
 		return errors.New("exiting")
 	}
 
+	// 将数据写入到 writeChan，由 ioLoop 协程处理
 	d.writeChan <- data
 	return <-d.writeResponseChan
 }
@@ -199,12 +219,14 @@ func (d *diskQueue) exit(deleted bool) error {
 		d.logf(INFO, "DISKQUEUE(%s): closing", d.name)
 	}
 
+	// 这里关闭 exitChan后，ioLoop 协程会退出执行，并向 exitSyncChan 写入数据以同步退出进度
 	close(d.exitChan)
 	// ensure that ioLoop has exited
 	<-d.exitSyncChan
 
 	close(d.depthChan)
 
+	// 关闭读写文件
 	if d.readFile != nil {
 		d.readFile.Close()
 		d.readFile = nil
@@ -230,13 +252,16 @@ func (d *diskQueue) Empty() error {
 
 	d.logf(INFO, "DISKQUEUE(%s): emptying", d.name)
 
+	// ioLoop 接收到 channel 数据后，执行退出操作
 	d.emptyChan <- 1
 	return <-d.emptyResponseChan
 }
 
 func (d *diskQueue) deleteAllFiles() error {
+	// 删除数据文件
 	err := d.skipToNextRWFile()
 
+	// 删除元数据文件
 	innerErr := os.Remove(d.metaDataFileName())
 	if innerErr != nil && !os.IsNotExist(innerErr) {
 		d.logf(ERROR, "DISKQUEUE(%s) failed to remove metadata file - %s", d.name, innerErr)
@@ -249,6 +274,7 @@ func (d *diskQueue) deleteAllFiles() error {
 func (d *diskQueue) skipToNextRWFile() error {
 	var err error
 
+	// 关闭当前读写文件
 	if d.readFile != nil {
 		d.readFile.Close()
 		d.readFile = nil
@@ -259,6 +285,7 @@ func (d *diskQueue) skipToNextRWFile() error {
 		d.writeFile = nil
 	}
 
+	// 删除所有数据文件
 	for i := d.readFileNum; i <= d.writeFileNum; i++ {
 		fn := d.fileName(i)
 		innerErr := os.Remove(fn)
@@ -268,6 +295,7 @@ func (d *diskQueue) skipToNextRWFile() error {
 		}
 	}
 
+	// 指定新的读写文件位置
 	d.writeFileNum++
 	d.writePos = 0
 	d.readFileNum = d.writeFileNum
@@ -285,6 +313,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 	var err error
 	var msgSize int32
 
+	// 打开待读取文件并定位到目标位置
 	if d.readFile == nil {
 		curFileName := d.fileName(d.readFileNum)
 		d.readFile, err = os.OpenFile(curFileName, os.O_RDONLY, 0600)
@@ -305,6 +334,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 
 		// for "complete" files (i.e. not the "current" file), maxBytesPerFileRead
 		// should be initialized to the file's size, or default to maxBytesPerFile
+		// 当前文件可读取的最大字节数不超过文件大小
 		d.maxBytesPerFileRead = d.maxBytesPerFile
 		if d.readFileNum < d.writeFileNum {
 			stat, err := d.readFile.Stat()
@@ -316,6 +346,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 		d.reader = bufio.NewReader(d.readFile)
 	}
 
+	// 数据长度占 4 字节
 	err = binary.Read(d.reader, binary.BigEndian, &msgSize)
 	if err != nil {
 		d.readFile.Close()
@@ -331,6 +362,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 		return nil, fmt.Errorf("invalid message read size (%d)", msgSize)
 	}
 
+	// 根据上面确定的数据长度读取数据
 	readBuf := make([]byte, msgSize)
 	_, err = io.ReadFull(d.reader, readBuf)
 	if err != nil {
@@ -341,49 +373,51 @@ func (d *diskQueue) readOne() ([]byte, error) {
 
 	totalBytes := int64(4 + msgSize)
 
-	// we only advance next* because we have not yet sent this to consumers
-	// (where readFileNum, readPos will actually be advanced)
+	// 移动下一次读取的位置，当前读取位置不变
 	d.nextReadPos = d.readPos + totalBytes
 	d.nextReadFileNum = d.readFileNum
 
 	// we only consider rotating if we're reading a "complete" file
 	// and since we cannot know the size at which it was rotated, we
 	// rely on maxBytesPerFileRead rather than maxBytesPerFile
+	// 如果一个文件读完了，则定位到下一个文件的开头
 	if d.readFileNum < d.writeFileNum && d.nextReadPos >= d.maxBytesPerFileRead {
 		if d.readFile != nil {
 			d.readFile.Close()
 			d.readFile = nil
 		}
-
+		// 定位到下一个文件
 		d.nextReadFileNum++
 		d.nextReadPos = 0
 	}
-
+	// 返回读取到的数据
 	return readBuf, nil
 }
 
-// writeOne performs a low level filesystem write for a single []byte
-// while advancing write positions and rolling files, if necessary
+// 用于将数据写入底层的磁盘文件中
 func (d *diskQueue) writeOne(data []byte) error {
 	var err error
 
+	// 数据大小检查
 	dataLen := int32(len(data))
+	// 完整的数据包括: 4 字节的长度 + 实际数据
 	totalBytes := int64(4 + dataLen)
 
 	if dataLen < d.minMsgSize || dataLen > d.maxMsgSize {
 		return fmt.Errorf("invalid message write size (%d) minMsgSize=%d maxMsgSize=%d", dataLen, d.minMsgSize, d.maxMsgSize)
 	}
 
-	// will not wrap-around if maxBytesPerFile + maxMsgSize < Int64Max
+	// 如果这条消息写入文件后，导致文件大小超过 maxBytesPerFile，则该消息不能写入到当前文件，而应该创建并写入到新文件
 	if d.writePos > 0 && d.writePos+totalBytes > d.maxBytesPerFile {
 		if d.readFileNum == d.writeFileNum {
 			d.maxBytesPerFileRead = d.writePos
 		}
 
+		// 将写入位置设置到下一个文件的开头
 		d.writeFileNum++
 		d.writePos = 0
 
-		// sync every time we start writing to a new file
+		// 每次写入到新文件时，都要将元数据信息和原始写入文件落盘
 		err = d.sync()
 		if err != nil {
 			d.logf(ERROR, "DISKQUEUE(%s) failed to sync - %s", d.name, err)
@@ -394,6 +428,7 @@ func (d *diskQueue) writeOne(data []byte) error {
 			d.writeFile = nil
 		}
 	}
+	// 创建或打开当前写入文件，并定位到写入位置
 	if d.writeFile == nil {
 		curFileName := d.fileName(d.writeFileNum)
 		d.writeFile, err = os.OpenFile(curFileName, os.O_RDWR|os.O_CREATE, 0600)
@@ -414,17 +449,19 @@ func (d *diskQueue) writeOne(data []byte) error {
 	}
 
 	d.writeBuf.Reset()
+	// 向写缓存中写入待写入数据的长度
 	err = binary.Write(&d.writeBuf, binary.BigEndian, dataLen)
 	if err != nil {
 		return err
 	}
 
+	// 向写缓存中写入待写入数据
 	_, err = d.writeBuf.Write(data)
 	if err != nil {
 		return err
 	}
 
-	// only write to the file once
+	// 将写缓存的数据写到文件
 	_, err = d.writeFile.Write(d.writeBuf.Bytes())
 	if err != nil {
 		d.writeFile.Close()
@@ -432,7 +469,9 @@ func (d *diskQueue) writeOne(data []byte) error {
 		return err
 	}
 
+	// 更新写入位置
 	d.writePos += totalBytes
+	// 更新消息数
 	d.depth += 1
 
 	return err
@@ -463,6 +502,7 @@ func (d *diskQueue) retrieveMetaData() error {
 	var f *os.File
 	var err error
 
+	// 读取元数据文件
 	fileName := d.metaDataFileName()
 	f, err = os.OpenFile(fileName, os.O_RDONLY, 0600)
 	if err != nil {
@@ -470,6 +510,7 @@ func (d *diskQueue) retrieveMetaData() error {
 	}
 	defer f.Close()
 
+	// 基于元数据文件内保存的信息，初始化磁盘队列
 	var depth int64
 	_, err = fmt.Fscanf(f, "%d\n%d,%d\n%d,%d\n",
 		&depth,
@@ -487,6 +528,8 @@ func (d *diskQueue) retrieveMetaData() error {
 	// in which case the safest thing to do is skip to the next file for
 	// writes, and let the reader salvage what it can from the messages in the
 	// diskqueue beyond the metadata's likely also stale readPos
+	// 如果数据写入文件之后，元数据信息刷新到磁盘之前宕机，则元数据中记录的位置信息就可能是错的
+	// 这里将写入位置移动到下一个文件
 	fileName = d.fileName(d.writeFileNum)
 	fileInfo, err := os.Stat(fileName)
 	if err != nil {
@@ -546,6 +589,7 @@ func (d *diskQueue) fileName(fileNum int64) string {
 }
 
 func (d *diskQueue) checkTailCorruption(depth int64) {
+	// 如果还有消息未读，直接返回
 	if d.readFileNum < d.writeFileNum || d.readPos < d.writePos {
 		return
 	}
@@ -587,11 +631,13 @@ func (d *diskQueue) checkTailCorruption(depth int64) {
 
 func (d *diskQueue) moveForward() {
 	oldReadFileNum := d.readFileNum
+	// 更新读取位置
 	d.readFileNum = d.nextReadFileNum
 	d.readPos = d.nextReadPos
+	// 消息数减一
 	d.depth -= 1
 
-	// see if we need to clean up the old file
+	// 当前读取文件和下一次读取文件不同，说明当前文件已经读完了，可以删除
 	if oldReadFileNum != d.nextReadFileNum {
 		// sync every time we start reading from a new file
 		d.needSync = true
@@ -602,7 +648,7 @@ func (d *diskQueue) moveForward() {
 			d.logf(ERROR, "DISKQUEUE(%s) failed to Remove(%s) - %s", d.name, fn, err)
 		}
 	}
-
+	// 检查尾部数据的完整性，如果有问题则跳过这部分数据
 	d.checkTailCorruption(d.depth)
 }
 
@@ -655,28 +701,38 @@ func (d *diskQueue) handleReadError() {
 func (d *diskQueue) ioLoop() {
 	var dataRead []byte
 	var err error
+	// 记录上次刷盘后新写入/读取的消息数
 	var count int64
 	var r chan []byte
 	var p chan []byte
 
+	// 启动定时器定时刷盘
 	syncTicker := time.NewTicker(d.syncTimeout)
 
 	for {
-		// dont sync all the time :)
+		// 每写入 syncEvery 条数据就进行一次 sync 操作
 		if count == d.syncEvery {
 			d.needSync = true
 		}
 
 		if d.needSync {
+			// 对文件进行 sync 操作刷盘
 			err = d.sync()
 			if err != nil {
 				d.logf(ERROR, "DISKQUEUE(%s) failed to sync - %s", d.name, err)
 			}
+			// sync 后 count 清零
 			count = 0
 		}
 
+		// 文件中有未读的数据
 		if (d.readFileNum < d.writeFileNum) || (d.readPos < d.writePos) {
+			// 什么情况下 nextReadPos == readPos，什么情况下不等于
+			// readOne 之后 nextReadPos 指向下一个位置，此时 nextReadPos != readPos
+			// 有协程从 readChan 读取数据之后，moveForward 将 readPos 移动到 nextReadPos，此时相同
+			// 不相等说明数据从文件读到内存了，但是内存中的数据还没读取
 			if d.nextReadPos == d.readPos {
+				// 从文件中读取一条消息
 				dataRead, err = d.readOne()
 				if err != nil {
 					d.logf(ERROR, "DISKQUEUE(%s) reading at %d of %s - %s",
@@ -688,26 +744,31 @@ func (d *diskQueue) ioLoop() {
 			r = d.readChan
 			p = d.peekChan
 		} else {
+			// 这里表明没有未读的数据
 			r = nil
 			p = nil
 		}
 
 		select {
-		// the Go channel spec dictates that nil channel operations (read or write)
-		// in a select are skipped, we set r to d.readChan only when there is data to read
+		// 上面读取到了一条消息，放到 readChan 中，readChan 会暴露给外部
 		case p <- dataRead:
 		case r <- dataRead:
 			count++
-			// moveForward sets needSync flag if a file is removed
+			// 更新readPos, readFileNum, nextReadPos, nextReadFileNum的信息
 			d.moveForward()
 		case d.depthChan <- d.depth:
 		case <-d.emptyChan:
+			// 执行清空操作(Empty函数)时，会向 emptyChan 写入数据，进入此分支
 			d.emptyResponseChan <- d.deleteAllFiles()
 			count = 0
 		case dataWrite := <-d.writeChan:
+			// 当有数据写入(如调用 Put 方法)的时候，并没有直接将数据直接写入文件，而是先写入writeChan，然后在这里调用 writeOne 写入文件
 			count++
+			// 写入完毕后，将响应写回 writeResponseChan，从而解除写入协程的阻塞
 			d.writeResponseChan <- d.writeOne(dataWrite)
 		case <-syncTicker.C:
+			// 达到指定刷盘间隔，此时需要将元数据和文件中的数据刷盘。
+			// count 为 0  表示上次刷盘后没有新数据写入，则不需执行刷盘操作
 			if count == 0 {
 				// avoid sync when there's no activity
 				continue
